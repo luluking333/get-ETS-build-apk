@@ -1,0 +1,674 @@
+name: Build APK (Auto-Generate Project)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle 8.7
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      # ============================================================
+      # 生成整个项目源码（会覆盖仓库中同名文件）
+      # ============================================================
+      - name: Generate project files
+        run: |
+          set -euo pipefail
+
+          mkdir -p app/src/main/java/com/example/etsanswer
+
+          # ---------- settings.gradle ----------
+          cat > settings.gradle << 'EOF'
+          include ':app'
+          rootProject.name = "ETSAnswer"
+EOF
+
+          # ---------- 根 build.gradle ----------
+          cat > build.gradle << 'EOF'
+          buildscript {
+              ext.kotlin_version = '1.9.24'
+              repositories { google(); mavenCentral() }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.5.2'
+                  classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+              }
+          }
+          allprojects { repositories { google(); mavenCentral() } }
+          EOF
+
+          # ---------- gradle.properties ----------
+          cat > gradle.properties << 'EOF'
+          android.useAndroidX=true
+          kotlin.code.style=official
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          EOF
+
+          # ---------- app/build.gradle ----------
+          cat > app/build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'kotlin-android'
+          }
+
+          android {
+              namespace 'com.example.etsanswer'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.example.etsanswer"
+                  minSdk 30
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              buildTypes { release { minifyEnabled false } }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.7.0'
+              implementation 'androidx.core:core-ktx:1.13.1'
+              implementation 'com.google.code.gson:gson:2.10.1'
+              implementation("com.indidevs.android:adbeesh:0.1.0-beta-1")
+              implementation("com.flyfishxu:kadb:2.1.5")
+              implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+              implementation 'androidx.security:security-crypto:1.1.0-alpha06'
+          }
+          EOF
+
+          # ---------- AndroidManifest.xml ----------
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="ETS答案"
+                  android:allowBackup="false"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name="com.indidevs.android.adbeesh.pairing.AdbPairingService"
+                      android:foregroundServiceType="connectedDevice"
+                      android:exported="false" />
+              </application>
+          </manifest>
+          EOF
+
+          # ---------- SettingConfig.kt ----------
+          cat > app/src/main/java/com/example/etsanswer/SettingConfig.kt << 'EOF'
+          package com.example.etsanswer
+
+          object SettingConfig {
+              val setting: MutableMap<String, MutableMap<String, MutableMap<String, String>>> =
+                  mutableMapOf(
+                      "class one" to mutableMapOf("output" to mutableMapOf(
+                          "number" to "true", "question" to "true",
+                          "options" to "true", "answer" to "true")),
+                      "class two" to mutableMapOf("output" to mutableMapOf(
+                          "number" to "true", "question" to "true",
+                          "answer_coming" to "true", "options" to "true", "answer" to "true")),
+                      "class three" to mutableMapOf("output" to mutableMapOf(
+                          "message" to "true", "number" to "true", "question" to "true",
+                          "options" to "true", "answer" to "true")),
+                      "class four" to mutableMapOf("output" to mutableMapOf(
+                          "number" to "true", "question" to "true", "answer" to "true"))
+                  )
+          }
+          EOF
+
+          # ---------- AdbPairingHelper.kt ----------
+          cat > app/src/main/java/com/example/etsanswer/AdbPairingHelper.kt << 'EOF'
+          package com.example.etsanswer
+
+          import android.content.Context
+          import com.indidevs.android.adbeesh.pairing.AdbPairing
+          import com.indidevs.android.adbeesh.pairing.AdbPairingWorkflow
+          import com.indidevs.android.adbeesh.pairing.AdbPairingCallback
+          import com.indidevs.android.adbeesh.notifications.NotificationCodeProvider
+          import com.indidevs.android.adbeesh.notifications.NotificationFlowConfig
+          import com.indidevs.android.adbeesh.notifications.NotificationCallback
+          import com.indidevs.android.adbeesh.config.AdbSessionConfig
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.GlobalScope
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          object AdbPairingHelper {
+
+              @Volatile var isPaired = false; private set
+
+              private lateinit var pairing: AdbPairing
+
+              /**
+               * 启动配对工作流（必须在主线程调用）。
+               * ensurePaired 内部会判断是否已配对，已配对则直接返回。
+               */
+              fun startPairing(context: Context, onResult: (Boolean) -> Unit) {
+                  val sessionConfig = AdbSessionConfig.Builder()
+                      .identityName("ETSAnswer")
+                      .build()
+
+                  val flowConfig = NotificationFlowConfig.Builder()
+                      .channel(id = "ets_pairing", name = "ETS 配对")
+                      .build()
+
+                  pairing = AdbPairing.get(context, id = "main", config = sessionConfig)
+
+                  val workflow = AdbPairingWorkflow.Builder()
+                      .withCodeProvider(NotificationCodeProvider(context, flowConfig))
+                      .addCallback(NotificationCallback(context, flowConfig))
+                      .addCallback(object : AdbPairingCallback {
+                          override fun onPairingSuccess(sessionId: String) {
+                              isPaired = true
+                              onResult(true)
+                          }
+                          override fun onPairingError(sessionId: String, error: String) {
+                              isPaired = false
+                              onResult(false)
+                          }
+                          override fun onPairingStarted(sessionId: String) {}
+                          override fun onPortFound(sessionId: String, port: Int) {}
+                          override fun onPairingHandshakeStarted(sessionId: String) {}
+                      })
+                      .build()
+
+                  GlobalScope.launch(Dispatchers.Main) {
+                      try {
+                          pairing.ensurePaired(workflow)
+                      } catch (e: Exception) {
+                          isPaired = false
+                          onResult(false)
+                      }
+                  }
+              }
+
+              /**
+               * 执行 shell 命令（suspend）。
+               * 每次 openSession().use { } 自动关闭会话，避免连接泄漏。
+               */
+              suspend fun runShell(command: String): String = withContext(Dispatchers.IO) {
+                  if (!isPaired) throw IllegalStateException("ADB 未配对，请先完成无线调试配对")
+
+                  pairing.openSession(timeoutMs = 10000).use { session ->
+                      if (!session.isAlive()) {
+                          throw IllegalStateException("ADB 会话已失效")
+                      }
+                      val result = session.shell(command)
+                      if (!result.isSuccess) {
+                          throw RuntimeException(result.error ?: "shell exit ${result.exitCode}")
+                      }
+                      result.output
+                  }
+              }
+
+              fun reset() { isPaired = false }
+              fun release() { reset() }
+          }
+          EOF
+
+          # ---------- EtsAnswerEngine.kt ----------
+          cat > app/src/main/java/com/example/etsanswer/EtsAnswerEngine.kt << 'EOF'
+          package com.example.etsanswer
+
+          import com.google.gson.JsonArray
+          import com.google.gson.JsonElement
+          import com.google.gson.JsonObject
+          import com.google.gson.JsonParser
+          import com.google.gson.JsonPrimitive
+          import kotlinx.coroutines.runBlocking
+
+          class EtsAnswerEngine(
+              private val log: (String) -> Unit
+          ) {
+              companion object {
+                  private const val BASE =
+                      "/storage/emulated/0/Android/data/com.ets100.secondary/files/Download/ETS_secondary/resource"
+              }
+
+              val answers = mutableListOf<JsonObject>()
+              private val contentPaths = mutableListOf<String>()
+
+              private fun runShell(command: String): String {
+                  return runBlocking { AdbPairingHelper.runShell(command) }
+              }
+
+              fun loadAnswers() {
+                  contentPaths.clear(); answers.clear()
+
+                  var files: List<String> = emptyList()
+                  var thinks = 0
+                  while (true) {
+                      try {
+                          val raw = runShell("cd $BASE && find -name 'content2.json'")
+                          files = raw.trim().split("\n").filter { it.isNotBlank() }
+                          if (files.isNotEmpty()) break
+                          throw RuntimeException("empty")
+                      } catch (e: Exception) {
+                          thinks++
+                          if (thinks >= 10) {
+                              log("你的文件似乎损坏了")
+                              return
+                          }
+                          log("获取失败，正在重试（$thinks/10）")
+                      }
+                  }
+
+                  files.forEachIndexed { i, f ->
+                      val clean = f.removePrefix("./")
+                      contentPaths.add(clean.removeSuffix("/content2.json"))
+                      try {
+                          val txt = runShell("cat '$BASE/$clean'")
+                          val json = JsonParser.parseString(txt).asJsonObject
+                          answers.add(processJson(json))
+                          log("获取 ${i + 1}/${files.size} 中...")
+                      } catch (e: Exception) {
+                          log("第 ${i + 1} 套解析失败：${e.message}")
+                      }
+                  }
+                  log("获取完毕（成功 ${answers.size}/${files.size} 套）")
+              }
+
+              private fun processJson(obj: JsonObject): JsonObject {
+                  val info = obj.getAsJsonObject("info")
+                  val xtnr = info?.get("xt_nr")?.takeIf { it.isJsonPrimitive }?.asString ?: ""
+                  if (xtnr.isEmpty()) return obj
+
+                  val result = replaceBrs(obj) as JsonObject
+                  try {
+                      val newInfo = result.getAsJsonObject("info")
+                      val t = newInfo.get("xt_nr").asString
+                      newInfo.addProperty("xt_nr", t.replace("</p>", "").replace("<p>", ""))
+                  } catch (_: Exception) {}
+                  return result
+              }
+
+              private fun replaceBrs(e: JsonElement): JsonElement = when {
+                  e.isJsonPrimitive && e.asJsonPrimitive.isString ->
+                      JsonPrimitive(e.asString.replace("</br>", "\n"))
+                  e.isJsonObject -> JsonObject().also { o ->
+                      e.asJsonObject.entrySet().forEach { (k, v) -> o.add(k, replaceBrs(v)) }
+                  }
+                  e.isJsonArray -> JsonArray().also { a ->
+                      e.asJsonArray.forEach { a.add(replaceBrs(it)) }
+                  }
+                  else -> e
+              }
+
+              private fun inferClass(group: JsonObject): String {
+                  val st = group.get("structure_type")?.asString ?: ""
+                  val info = group.getAsJsonObject("info") ?: return "class one"
+                  if (st == "collector.fill") return "class four"
+                  val hasText = (info.get("st_nr")?.takeIf { it.isJsonPrimitive }?.asString ?: "").isNotBlank() ||
+                                (info.get("value")?.takeIf { it.isJsonPrimitive }?.asString ?: "").isNotBlank()
+                  if (hasText) return "class three"
+                  val xts = info.getAsJsonArray("xtlist") ?: return "class one"
+                  for (q in xts) {
+                      val opts = q.asJsonObject.getAsJsonArray("xxlist") ?: continue
+                      for (o in opts) {
+                          if ((o.asJsonObject.get("xx_wj")?.takeIf { it.isJsonPrimitive }?.asString ?: "")
+                                  .endsWith(".jpg")) return "class two"
+                      }
+                  }
+                  return "class one"
+              }
+
+              private fun parseFilter(input: String?): Set<Int>? {
+                  if (input.isNullOrBlank() || input == "all") return null
+                  val set = mutableSetOf<Int>()
+                  input.replace(" ", "").split(",").forEach { p ->
+                      if (p.isBlank()) return@forEach
+                      if (p.contains("-")) {
+                          val parts = p.split("-")
+                          if (parts.size == 2) set.addAll(parts[0].toInt()..parts[1].toInt())
+                          else throw IllegalArgumentException("bad range: $p")
+                      } else set.add(p.toInt())
+                  }
+                  return set
+              }
+
+              fun printAnswers(questions: String? = "all") {
+                  val filter = parseFilter(questions)
+                  val setting = SettingConfig.setting
+                  val order = listOf("message", "number", "question", "answer_coming", "options", "answer")
+
+                  var total = 0
+                  answers.forEach { g ->
+                      val info = g.getAsJsonObject("info")
+                      when (g.get("structure_type")?.asString) {
+                          "collector.choose" -> total += (info?.getAsJsonArray("xtlist")?.size() ?: 0)
+                          "collector.fill"   -> total += (info?.getAsJsonArray("std")?.size() ?: 0)
+                      }
+                  }
+                  log("共 $total 题\n")
+
+                  answers.forEach { group ->
+                      val cls = inferClass(group)
+                      val cfg = setting[cls]?.get("output") ?: emptyMap()
+                      val info = group.getAsJsonObject("info") ?: return@forEach
+                      val globalText = (info.get("st_nr")?.takeIf { it.isJsonPrimitive }?.asString ?: "")
+                          .ifBlank { info.get("value")?.takeIf { it.isJsonPrimitive }?.asString ?: "" }
+                          .trim()
+
+                      when (group.get("structure_type")?.asString) {
+                          "collector.choose" -> {
+                              info.getAsJsonArray("xtlist")?.forEach { qElem ->
+                                  val q = qElem.asJsonObject
+                                  val raw = q.get("xt_nr")?.takeIf { it.isJsonPrimitive }?.asString?.trim() ?: ""
+                                  val num = Regex("^\\d+").find(raw)?.value?.toIntOrNull()
+                                  if (filter != null && num !in filter) return@forEach
+
+                                  val (number, questionText) = if ('.' in raw) {
+                                      val parts = raw.split(".", limit = 2)
+                                      (parts[0] + ".") to (parts.getOrNull(1)?.trim() ?: "")
+                                  } else raw to ""
+
+                                  val qText = questionText.ifBlank {
+                                      q.get("xt_value")?.takeIf { it.isJsonPrimitive }?.asString ?: ""
+                                  }
+
+                                  val optsStr = (q.getAsJsonArray("xxlist") ?: JsonArray()).joinToString(" | ") { o ->
+                                      val oo = o.asJsonObject
+                                      val text = (oo.get("xx_nr")?.takeIf { it.isJsonPrimitive }?.asString ?: "")
+                                          .trim().ifBlank {
+                                              val wj = oo.get("xx_wj")?.takeIf { it.isJsonPrimitive }?.asString ?: ""
+                                              if (wj.isNotBlank()) "[图片: $wj]" else ""
+                                          }
+                                      "${oo.get("xx_mc")?.takeIf { it.isJsonPrimitive }?.asString ?: ""}. $text"
+                                  }
+
+                                  val ans = q.get("answer")?.takeIf { it.isJsonPrimitive }?.asString ?: ""
+                                  emitFields(order, cfg, globalText, number, qText, "(choose)", optsStr, ans)
+                              }
+                          }
+                          "collector.fill" -> {
+                              info.getAsJsonArray("std")?.forEach { item ->
+                                  val it = item.asJsonObject
+                                  val n = it.get("th")?.takeIf { it.isJsonPrimitive }?.asInt ?: 0
+                                  if (filter != null && n !in filter) return@forEach
+                                  val number = "$n."
+                                  val ans = (it.get("value")?.takeIf { it.isJsonPrimitive }?.asString ?: "")
+                                      .split("/")[0]
+                                  emitFields(order, cfg, globalText, number, "", "(fill)", "", ans)
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun emitFields(
+                  order: List<String>, cfg: Map<String, String>,
+                  msg: String, number: String, q: String, coming: String, opts: String, ans: String
+              ) {
+                  val sb = StringBuilder()
+                  order.forEach { f ->
+                      if (cfg[f] != "true") return@forEach
+                      sb.append(when (f) {
+                          "message"       -> "message: $msg"
+                          "number"        -> "number: $number"
+                          "question"      -> "question: $q"
+                          "answer_coming" -> "answer_coming: $coming"
+                          "options"       -> "options: $opts"
+                          "answer"        -> "answer: $ans"
+                          else -> ""
+                      }).append("\n")
+                  }
+                  log(sb.toString())
+              }
+
+              fun showFields() {
+                  val map = mutableMapOf<String, MutableSet<String>>()
+                  SettingConfig.setting.forEach { (_, cfg) ->
+                      cfg["output"]?.forEach { (k, v) -> map.getOrPut(k) { mutableSetOf() }.add(v) }
+                  }
+                  val sb = StringBuilder()
+                  map.forEach { (f, vals) ->
+                      sb.append("$f: ").append(if (vals.size == 1) vals.first() else "不一致 $vals").append("\n")
+                  }
+                  log(sb.toString())
+              }
+
+              fun setOpt(field: String, value: String) {
+                  var hit = false
+                  SettingConfig.setting.values.forEach { cfg ->
+                      cfg["output"]?.let { if (it.containsKey(field)) { it[field] = value; hit = true } }
+                  }
+                  log(if (hit) "已设置 $field = $value" else "字段不存在：$field")
+              }
+
+              fun removeAnswer(silent: Boolean = false) {
+                  answers.clear()
+                  if (!silent) log("已移除本地答案")
+              }
+
+              fun removeOldTest() {
+var ok=0
+                  contentPaths.forEach { p ->
+                      try {
+                          runShell("rm -rf '$BASE/$p'")
+好的++
+                      } catch (e: Exception) {
+                          log("删除 $p 失败：${e.message}")
+                      }
+                  }
+                  log("已移除 $ok/${contentPaths.size} 套旧试卷")
+contentPaths.clear()
+              }
+          }
+EOF
+
+          # ---------- MainActivity.kt ----------
+          cat > app/src/main/java/com/example/etsanswer/MainActivity.kt << 'EOF'
+package com.example.etsanswer
+
+          import android.Manifest
+导入安卓. 操作系统. 构建
+进口安卓. 操作系统.
+导入android.text.method.ScrollingMovementMethod
+没有任何的东西.
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.app.AppCompatActivity
+导入androidx.core.app.ActivityCompat
+导入androidx.core.view.setPadding
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var logView: TextView
+              private lateinit var statusView: TextView
+              private lateinit var scrollView: ScrollView
+              private lateinit var engine: EtsAnswerEngine
+              private lateinit var pairingBtn: Button
+私有值logBuf=StringBuilder()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+super.onCreate(savedInstanceState)
+
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+
+                  val root = LinearLayout(this).apply {
+方向=线性布局.垂直
+setPadding(24)
+                  }
+
+                  statusView = TextView(this).apply {
+textSize=13f
+SetTextColor(0xFF00FF88.toInt())
+文本="ADB：未配对"
+                  }
+
+                  logView = TextView(this).apply {
+textSize=13f
+字体=android.graphics.Typeface.MONOSPACE
+movementMethod=ScrollingMovementMethod()
+SetTextColor(0xFFE0E0E0.toInt())
+setBackgroundColor(0xFF1A1A.toInt())
+setPadding(16)
+                  }
+ScrollView=ScrollView(此).应用{addView(logView)}
+
+                  root.addView(statusView)
+root.addView(scrollView,线性布局.布局参数(-1, 0, 1f))
+
+                  pairingBtn = Button(this).apply {
+文本="开始无线调试配对"
+LayoutParams=LinearLayout.LayoutParams(-1, -2)
+没有任何的{ startPairing() }
+                  }
+root.addView(pairingBtn)
+
+Val grid=GridLayout(此)。应用{columnCount=3；rowcount=2}
+listof("1.获取答案", "2.删除答案", "3.显示答案",
+                         "4.设置",     "5.信息",     "6.退出"对于每一个指数{我,没有
+Val b=按钮(this)。应用{
+text=t
+LayoutParams=GridLayout.LayoutParams().apply{
+宽度=0
+columnSpec=GridLayout.spec(i%3, 1f)
+rowSpec=GridLayout.spec(i/3, 1f)
+设置边界值(4, 4, 4, 4)
+                          }
+没有任何的{onMenu(i+1)}
+                      }
+grid.addView(b)
+                  }
+root.addView(网格)
+
+setContentView(根)
+
+发动机=EtsAnswerEngine(log={消息->runOnUiThread{没有任何的} })
+refreshStatus()
+              }
+
+私人趣味启动配对(){
+appendLog("正在启动 ADB 配对工作流…")
+appendLog("请到 设置 → 开发者选项 → 无线调试，按通知提示完成配对。")
+AdbPairingHelper.startPairing(this){确定
+runOnUiThread{
+refreshStatus()
+if(合格){
+appendLog("配对成功，ADB 通道已就绪。")
+pairingBtn.text="重新配对"
+}其他{
+appendLog("配对未完成，请重试。")
+                          }
+                      }
+                  }
+              }
+
+私人fun refreshstatus(){
+statusView.text=if(AdbPairingHelper.isPaired)"亚行：已配对 ✅"其他"亚行：未配对 ❌"
+              }
+
+值的值是指值的值的值.
+没有任何其他方法可以实现.
+没有任何的字符串
+ScrollView。发布{ScrollView。完整卷动(ScrollView.focus_DOWN)}
+              }
+
+私人娱乐onMenu(idx:Int){
+如果 (!AdbPairingHelper.isPaired && idx in listOf(1, 2, 3)) {
+appendLog("请先完成无线调试配对。")；返回
+                  }
+when(idx){
+1->线程{
+尝试{engine.loadAnswers()}
+catch(e:Exception){runOnUiThread{appendLog("失败：${e.message}")}}
+runOnUiThread{refreshStatus()}
+开始
+
+2->AlertDialog.Builder(this).setTitle("删除答案")
+.setItems(arrayOf(Val a=EditText(this).应用私人fun提示Range(), "移除旧试卷")) { _,W->, "移除旧试卷")) { _,W->
+线程{
+尝试
+if(w==0)engine.removeAnswer()
+其他{引擎。removeOldTest()；发动机.removeAnswer()}{引擎.removeOldTest()；引擎.removeAnswer()}{引擎。removeOldTest()；发动机.removeAnswer()}{引擎.removeOldTest()；引擎.removeAnswer()}
+}捕获(e：异常){捕获(e：异常){捕获(e：异常){捕获(e：异常){
+runOnUiThread{appendLog("失败：${e.message}")}{appendLog("失败：${e.message}")}{appendLog("失败：${e.message}")}{appendLog("失败：${e.message}")}
+                                  }
+runOnUiThread{refreshStatus()}{refreshStatus()}{refreshStatus()}{refreshStatus()}
+开始
+现在我们要去看看.
+
+3->AlertDialog.Builder(this).setTitle("查询类型")"查询类型")"查询类型")"查询类型")
+.setItems{}arrayof{}一个字符串"单题"，"多道连续题"，"全部")){_，w->{}arrayof{}一个字符串"单题"，"多道连续题"，"全部")){_，w->
+当(w){
+没有任何的"进口题号"){s->"进口题号"){s->
+尝试{引擎.打印答案}上(异常){appendLog("错误输入")}{引擎.打印答案}上(异常){appendLog("错误输入")}
+                                  }
+1 -> 快速范围
+2->尝试{引擎.打印答案("全部")}catch(e:Exception){appendLog("失败：${e.message}")}
+                              }}
+现在我们要去看看.
+
+                      4 -> {
+engine.showFields()
+快速输入"格式：字段 值（例：answer true）") {s->"格式：字段 值（例：answer true）") {s->
+val p=s.trim().split(正则表达式("\\s+"))"\\s+"))
+如果(p.size>=2)引擎.setOpt(p[0],p[1])else appendLog("格式错误")[0],p[1])else appendLog("格式错误")
+                          }
+                      }
+
+5->appendLog("ETS答案 · ADBeesh 版\n仅限个人已购课程自测，24小时内删除")"ETS答案 · ADBeesh 版\n仅限个人已购课程自测，24小时内删除")
+
+                      6 -> {
+AdbPairingHelper.release()
+appendLog(“再见”)
+finishAndRemoveTask()
+                      }
+                  }
+              }
+
+重写fun onDestroy(){
+super.onDestroy()
+AdbPairingHelper.release()
+              }
+
+私人趣味提示输入(提示：String，Onok：(String)->Unit){
+Valet=EditText(this)。应用{这。提示=提示}
+AlertDialog.Builder(此).setTitle(提示).setView(et)
+.setPositiveButton("确定"){_，_->Onok(et.文本。toString())}
+.setNegativeButton("取消"，null).show()
+              }
+
+私人fun提示Range(){
+Val box=LinearLayout(this)。应用{
+方向=LinearLayout.VERTICAL；setPadding(48，16，48，16)
+                  }
+Val a=EditText(this).应用私人fun提示Range()}()}
